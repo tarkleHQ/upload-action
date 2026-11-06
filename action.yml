@@ -1,0 +1,60 @@
+name: "Share files with Tarkle"
+description: "Upload one or more files from a workflow run to Tarkle and get back a shareable link, with optional expiry, password and one-time-download protection."
+author: "Tarkle"
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  api-key:
+    description: "A Tarkle API key (Settings > API). Pass it through a GitHub Actions secret, never as a literal value."
+    required: true
+  workspace:
+    description: "The 8-character workspace key the files belong to (GET /workspaces, or Settings > API, lists your keys)."
+    required: true
+  files:
+    description: "One or more local file paths to upload and share, one per line. Each is uploaded into the library, then included in a single transfer."
+    required: true
+  folder:
+    description: "A remote library folder to upload into, such as /ci-builds. Created if it does not exist. Omit for the library root."
+    required: false
+  duration:
+    description: "How long the link stays active: 1h, 24h, 3d, 7d, 14d or 30d. Omit for a link that never expires. Ignored if expires-at is set."
+    required: false
+  expires-at:
+    description: "An exact ISO 8601 expiry timestamp. Overrides duration."
+    required: false
+  password:
+    description: "A password required to open the link. Pass it through a GitHub Actions secret."
+    required: false
+  burn-after-read:
+    description: "The link stops working after its first download."
+    required: false
+    default: "false"
+  title:
+    description: "A title shown on the share page."
+    required: false
+  description:
+    description: "A description shown on the share page."
+    required: false
+  on-conflict:
+    description: "What to do when a file of the same name already exists in the destination folder: version, separate or skip. Default follows the workspace's own plan rule."
+    required: false
+  api-url:
+    description: "The Tarkle API base URL."
+    required: false
+    default: "https://tarkle.com/api/v1"
+
+outputs:
+  url:
+    description: "The share link."
+  id:
+    description: "The transfer id."
+  expires-at:
+    description: "When the link expires (ISO 8601), or empty if it never does."
+  result:
+    description: "The complete JSON response from POST /api/v1/transfers."
+
+runs:
+  using: "node20"
+  main: "dist/index.js"
