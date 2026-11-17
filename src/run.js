@@ -3,7 +3,7 @@
 // from index.js so tests can call it directly with real @actions/core env-var inputs, the same
 // convention tools/tarkle-cli's own tests use (real functions, a local HTTP server, no deep mocking).
 import * as core from "@actions/core";
-import { createClient } from "@tarkle/cli/lib/client.mjs";
+import { createClient, errorJson, exitCodeFor, formatError } from "@tarkle/cli/lib/client.mjs";
 import { createCommands } from "@tarkle/cli/lib/commands.mjs";
 
 const DURATION = /^(\d+)(h|d)$/;
@@ -96,4 +96,28 @@ export async function run() {
   }
 
   return transfer;
+}
+
+const EXIT_MEANING = {
+  1: "error",
+  2: "not signed in or not allowed",
+  3: "daily quota or AI credits used up, do not retry",
+  4: "rate limited after retries, run again later",
+  5: "network or server trouble",
+};
+
+/** Turns a thrown error into the same exit code the CLI would return, so a workflow can react to the cause. */
+export function failureOf(error) {
+  const exitCode = exitCodeFor(error);
+  const detail = errorJson(error).error;
+  return { exitCode, code: detail.code, status: detail.status, retryAfter: detail.retry_after ?? "", message: formatError(error) };
+}
+
+export function reportFailure(error) {
+  const failure = failureOf(error);
+  core.setOutput("exit-code", String(failure.exitCode));
+  core.setOutput("error-code", failure.code);
+  core.setOutput("retry-after", String(failure.retryAfter));
+  core.setFailed(`${failure.message}\n(exit code ${failure.exitCode}: ${EXIT_MEANING[failure.exitCode] ?? "error"})`);
+  return failure;
 }

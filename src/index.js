@@ -1,4 +1,3 @@
-import * as core from "@actions/core";
-import { run } from "./run.js";
+import { run, reportFailure } from "./run.js";
 
-run().catch((error) => core.setFailed(error instanceof Error ? error.message : String(error)));
+run().catch(reportFailure);

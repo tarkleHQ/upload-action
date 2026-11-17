@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, test } from "node:test";
-import { ensureFolder, expiresAtFrom, parseFiles, run } from "../src/run.js";
+import { ensureFolder, expiresAtFrom, failureOf, parseFiles, reportFailure, run } from "../src/run.js";
 import { createClient } from "@tarkle/cli/lib/client.mjs";
 
 let server;
@@ -35,7 +35,7 @@ before(async () => {
       return;
     }
     const answer = await handler(call);
-    res.writeHead(answer.status ?? 200, { "content-type": "application/json" });
+    res.writeHead(answer.status ?? 200, { "content-type": "application/json", ...(answer.headers ?? {}) });
     res.end(JSON.stringify(answer.body));
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -172,4 +172,41 @@ test("run(): a given folder is created first, and files upload into it", async (
   } finally {
     clearEnv({ "api-key": "", workspace: "", files: "", folder: "", "api-url": "" });
   }
+});
+
+async function failWith(status, headers, body) {
+  const file = join(dir, "fail.txt");
+  await writeFile(file, "hello");
+  handlers["POST /api/v1/uploads"] = () => ({ status, headers, body });
+  setEnv({ "api-key": "tk_x", workspace: "abcd1234", files: file, "api-url": `${base}/api/v1` });
+  try {
+    await run();
+    assert.fail("run() should have failed");
+  } catch (error) {
+    return { failure: reportFailure(error), output: await readFile(outputFile, "utf8") };
+  } finally {
+    clearEnv({ "api-key": "", workspace: "", files: "", "api-url": "" });
+    process.exitCode = 0;
+  }
+}
+
+test("a refused key fails with exit code 2 and sets exit-code and error-code", async () => {
+  const { failure, output } = await failWith(401, {}, { code: "unauthorized", detail: "Bad token." });
+  assert.equal(failure.exitCode, 2);
+  assert.match(output, /exit-code<<.*\n2/);
+  assert.match(output, /error-code<<.*\nunauthorized/);
+});
+
+test("a used-up daily quota fails with exit code 3 and passes Retry-After on", async () => {
+  const { failure, output } = await failWith(429, { "retry-after": "40000" }, { code: "quota_exceeded", detail: "Daily limit." });
+  assert.equal(failure.exitCode, 3);
+  assert.match(output, /exit-code<<.*\n3/);
+  assert.match(output, /error-code<<.*\nquota_exceeded/);
+  assert.match(output, /retry-after<<.*\n40000/);
+});
+
+test("failureOf maps a plain error to 1 and a server error to 5", async () => {
+  assert.equal(failureOf(new Error("bad input")).exitCode, 1);
+  const { failure } = await failWith(503, {}, { code: "unavailable", detail: "Down." });
+  assert.equal(failure.exitCode, 5);
 });

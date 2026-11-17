@@ -41,9 +41,8 @@ inputs:
     description: "What to do when a file of the same name already exists in the destination folder: version, separate or skip. Default follows the workspace's own plan rule."
     required: false
   api-url:
-    description: "The Tarkle API base URL."
+    description: "The Tarkle API base URL. Omit to use the address built into the Tarkle CLI."
     required: false
-    default: "https://tarkle.com/api/v1"
 
 outputs:
   url:
@@ -54,6 +53,12 @@ outputs:
     description: "When the link expires (ISO 8601), or empty if it never does."
   result:
     description: "The complete JSON response from POST /api/v1/transfers."
+  exit-code:
+    description: "Set when the step fails: 1 error, 2 not signed in or not allowed, 3 daily quota or AI credits used up, 4 rate limited after retries, 5 network or server trouble. The same codes the Tarkle CLI returns."
+  error-code:
+    description: "Set when the step fails: the API error code, for example quota_exceeded or unauthorized."
+  retry-after:
+    description: "Set when the step fails and the API said when to try again: the Retry-After value."
 
 runs:
   using: "node20"

@@ -27428,6 +27428,12 @@ var __webpack_exports__ = {};
 var core = __nccwpck_require__(7484);
 // EXTERNAL MODULE: external "node:crypto"
 var external_node_crypto_ = __nccwpck_require__(7598);
+;// CONCATENATED MODULE: ./node_modules/@tarkle/cli/lib/defaults.mjs
+// The one place this tool names a Tarkle address. This package is published on its own, so it cannot import
+// lib/primary-domain.mjs; the host registry for the app is lib/platform-hosts.mjs and this value follows its primary domain.
+// Every override wins: --api-url, TARKLE_API_URL, or `api_url` in the saved config. An older saved address keeps working.
+const defaults_DEFAULT_API_URL = "https://tarkle.tech/api/v1";
+
 ;// CONCATENATED MODULE: external "node:fs"
 const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
 ;// CONCATENATED MODULE: ./node_modules/@tarkle/cli/lib/version.mjs
@@ -27439,7 +27445,8 @@ const VERSION = JSON.parse((0,external_node_fs_namespaceObject.readFileSync)(__n
 
 
 
-const DEFAULT_API_URL = "https://tarkle.com/api/v1";
+
+
 
 class ApiError extends Error {
   constructor(problem, status) {
@@ -27452,11 +27459,35 @@ class ApiError extends Error {
   }
 }
 
-const WRITE = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+function problemOf(text) {
+  try {
+    const data = text ? JSON.parse(text) : null;
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    return null;
+  }
+}
 
-// One place that talks to the API: bearer token, workspace key, an Idempotency-Key on every write, one retry after a 429.
-function createClient({ token, workspace, apiUrl = DEFAULT_API_URL, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
-  if (!token) throw new ApiError({ code: "no_token", detail: "No API token. Run `tarkle login <token>` or set TARKLE_API_TOKEN. Create a token in Settings > API." }, 0);
+const WRITE = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+// A 429 that only waiting until the next day or a top-up can fix: never retried.
+const SPENT = new Set(["quota_exceeded", "ai_budget"]);
+const RETRY_STATUS = new Set([500, 502, 503, 504]);
+const backoff = (attempt) => Math.min(500 * 2 ** attempt, 8000);
+
+// Turns a thrown fetch failure into one error with a code the exit-code mapping understands.
+function networkError(error, what) {
+  const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+  return new ApiError({ code: timedOut ? "timeout" : "network_error", detail: timedOut ? `${what} timed out.` : `Could not reach ${what}: ${error?.cause?.code || error?.message || error}.` }, 0);
+}
+
+// One place that talks to the API: bearer token, workspace key, an Idempotency-Key on every write (the same key on every retry
+// of one call, so a retried write cannot happen twice), a timeout on every request, bounded retries on network errors and 5xx,
+// waits on a per-minute 429, and a clear error for a redirect or an answer that is not JSON.
+function createClient({
+  token, workspace, apiUrl = defaults_DEFAULT_API_URL, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  timeoutMs = 60_000, storageTimeoutMs = 600_000, retries = 3, rateLimitRetries = 2,
+}) {
+  if (!token) throw new ApiError({ code: "no_token", detail: "No API token. Run `tarkle login`, or set TARKLE_API_KEY. Create a key in Settings > API." }, 0);
   const base = apiUrl.replace(/\/+$/, "");
 
   async function request(method, path, { query, body, workspaceKey = true, raw = false } = {}) {
@@ -27466,26 +27497,96 @@ function createClient({ token, workspace, apiUrl = DEFAULT_API_URL, fetchImpl = 
     if (workspaceKey && workspace) headers["X-Workspace-Key"] = workspace;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (WRITE.has(method)) headers["Idempotency-Key"] = (0,external_node_crypto_.randomUUID)();
-    for (let attempt = 0; ; attempt++) {
-      const response = await fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-      if (response.status === 429 && attempt === 0) {
-        const wait = Math.min(Math.max(Number(response.headers.get("retry-after")) || 1, 1), 60);
-        await sleep(wait * 1000);
+    let failures = 0;
+    let limited = 0;
+    for (;;) {
+      let response;
+      try {
+        // redirect "manual": a redirect turns a POST into a GET and drops the body and the token, so it is never followed.
+        response = await fetchImpl(url, { method, headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs), body: body === undefined ? undefined : JSON.stringify(body) });
+      } catch (error) {
+        if (failures++ < retries) {
+          await sleep(backoff(failures - 1));
+          continue;
+        }
+        throw networkError(error, url.origin);
+      }
+      if (response.status >= 300 && response.status < 400) {
+        const where = response.headers.get("location");
+        throw new ApiError({ code: "redirected", detail: `The API address redirected${where ? ` to ${where}` : ""} (${response.status}). Set TARKLE_API_URL (or --api-url) to the address that answers directly.` }, response.status);
+      }
+      if (RETRY_STATUS.has(response.status) && failures++ < retries) {
+        await response.text().catch(() => "");
+        await sleep(backoff(failures - 1));
         continue;
       }
+      let text = null;
+      if (response.status === 429 && limited < rateLimitRetries) {
+        // A per-minute limit is worth a short wait. A daily quota (quota_exceeded) resets at midnight UTC: fail at once.
+        text = await response.text();
+        if (!SPENT.has(problemOf(text)?.code)) {
+          const wait = Math.min(Math.max(Number(response.headers.get("retry-after")) || 1, 1), 60);
+          limited++;
+          await sleep(wait * 1000);
+          continue;
+        }
+      }
       if (raw && response.ok) return response;
-      const text = await response.text();
+      try {
+        if (text === null) text = await response.text();
+      } catch (error) {
+        throw networkError(error, url.origin);
+      }
       let data = null;
+      let parsed = true;
       try {
         data = text ? JSON.parse(text) : null;
       } catch {
         data = null;
+        parsed = false;
       }
       if (!response.ok) {
         const problem = data && typeof data === "object" ? data : { detail: text.slice(0, 200) };
         throw new ApiError({ ...problem, retryAfter: response.headers.get("retry-after") }, response.status);
       }
+      if (!parsed) throw new ApiError({ code: "bad_response", detail: `${url.origin} answered ${response.status} but not with JSON. Check TARKLE_API_URL.` }, response.status);
       return data;
+    }
+  }
+
+  // A PUT to a signed storage address: bounded retries with backoff on network errors and 5xx, a long timeout, the body made
+  // fresh for each attempt (a stream cannot be sent twice). `refreshUrl` fetches a new signed address before a retry.
+  async function storagePut(url, { makeBody, size, contentType, refreshUrl }) {
+    let target = url;
+    let replaced = false;
+    for (let attempt = 0; ; attempt++) {
+      let response;
+      try {
+        const headers = { ...(contentType ? { "Content-Type": contentType } : {}), ...(size !== undefined ? { "Content-Length": String(size) } : {}) };
+        response = await fetchImpl(target, { method: "PUT", body: makeBody(), headers, duplex: "half", redirect: "manual", signal: AbortSignal.timeout(storageTimeoutMs) });
+      } catch (error) {
+        if (attempt < retries) {
+          await sleep(backoff(attempt));
+          if (refreshUrl) target = await refreshUrl();
+          continue;
+        }
+        throw networkError(error, "the storage address");
+      }
+      if (response.ok) return;
+      await response.text().catch(() => "");
+      // A signed address that was refused has most likely expired: ask for a new one once.
+      if (response.status === 403 && refreshUrl && !replaced) {
+        replaced = true;
+        target = await refreshUrl();
+        continue;
+      }
+      if ((RETRY_STATUS.has(response.status) || response.status === 408) && attempt < retries) {
+        await sleep(backoff(attempt));
+        if (refreshUrl) target = await refreshUrl();
+        continue;
+      }
+      const error = new ApiError({ code: response.status >= 500 ? "storage_unavailable" : "storage_rejected", detail: `Storage answered ${response.status} while uploading.` }, response.status);
+      throw error;
     }
   }
 
@@ -27495,14 +27596,34 @@ function createClient({ token, workspace, apiUrl = DEFAULT_API_URL, fetchImpl = 
     patch: (path, body) => request("PATCH", path, { body }),
     del: (path, query) => request("DELETE", path, { query }),
     request,
+    storagePut,
   };
+}
+
+// 0 done, 1 error, 2 not signed in or not allowed, 3 daily quota used up, 4 rate limited after the retries, 5 network or server trouble.
+function exitCodeFor(error) {
+  if (!(error instanceof ApiError)) return 1;
+  if (error.code === "storage_rejected") return 1;
+  if (error.code === "no_token" || error.status === 401 || error.status === 403) return 2;
+  if (SPENT.has(error.code)) return 3;
+  if (error.status === 429) return 4;
+  if (error.code === "network_error" || error.code === "timeout" || error.code === "storage_unavailable" || error.status >= 500) return 5;
+  return 1;
+}
+
+function errorJson(error) {
+  if (!(error instanceof ApiError)) return { error: { code: "error", status: 0, message: error instanceof Error ? error.message : String(error) } };
+  return { error: { code: error.code, status: error.status, message: error.message, ...(error.retryAfter ? { retry_after: Number(error.retryAfter) || error.retryAfter } : {}), ...(error.details ? { details: error.details } : {}) } };
 }
 
 function formatError(error) {
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : String(error);
   const lines = [error.message];
   if (error.code && error.code !== "no_token") lines[0] += ` (${error.code}${error.status ? `, ${error.status}` : ""})`;
-  if (error.status === 429 && error.retryAfter) lines.push(`Rate limited. Try again in ${error.retryAfter} seconds.`);
+  if (error.code === "quota_exceeded") {
+    const secs = Number(error.retryAfter);
+    if (secs > 0) lines.push(`The daily limit resets at ${new Date(Date.now() + secs * 1000).toISOString().replace(/:\d\d\.\d+Z$/, " UTC").replace("T", " ")} (in ${secs >= 3600 ? `${Math.round(secs / 3600)} hours` : `${Math.ceil(secs / 60)} minutes`}).`);
+  } else if (error.status === 429 && error.retryAfter) lines.push(`Rate limited. Try again in ${error.retryAfter} seconds.`);
   if (error.code === "conflict" && error.details?.choices) lines.push(`Answer with --on-conflict ${error.details.choices.join(" | ")}.`);
   if (error.code === "transfer_active") lines.push("A transfer holds this item. Repeat with --confirm-delete-transfers to delete the transfers too.");
   return lines.join("\n");
@@ -27517,6 +27638,8 @@ const external_node_fs_promises_namespaceObject = __WEBPACK_EXTERNAL_createRequi
 ;// CONCATENATED MODULE: external "node:path"
 const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
 ;// CONCATENATED MODULE: ./node_modules/@tarkle/cli/lib/commands.mjs
+
+
 
 
 
@@ -27567,12 +27690,23 @@ async function sha256Of(path) {
   return hash.digest("hex");
 }
 
-async function putBytes(fetchImpl, url, body, contentType) {
-  const response = await fetchImpl(url, { method: "PUT", body, headers: contentType ? { "Content-Type": contentType } : {} });
-  if (!response.ok) throw new Error(`Storage answered ${response.status} while uploading.`);
+const PART_CONCURRENCY = 3;
+const URL_BATCH = 20;
+
+// Every regular file under a directory, in a stable order, with its path relative to the directory. Links are skipped.
+async function walk(root, rel = "") {
+  const found = [];
+  const names = (await (0,external_node_fs_promises_namespaceObject.readdir)((0,external_node_path_namespaceObject.join)(root, rel))).sort();
+  for (const name of names) {
+    const relative = rel ? `${rel}/${name}` : name;
+    const info = await (0,external_node_fs_promises_namespaceObject.lstat)((0,external_node_path_namespaceObject.join)(root, relative));
+    if (info.isDirectory()) found.push(...(await walk(root, relative)));
+    else if (info.isFile()) found.push({ local: (0,external_node_path_namespaceObject.join)(root, relative), relative });
+  }
+  return found;
 }
 
-function createCommands({ api, out, fetchImpl = fetch }) {
+function createCommands({ api, out, err = () => {}, fetchImpl = fetch }) {
   const show = (data, human, json) => out(json ? JSON.stringify(data, null, 2) : human);
   const rows = (entries) => entries.map((e) => `${e.type === "folder" ? "d" : "-"} ${String(e.id).padEnd(36)} ${formatBytes(e.size).padStart(9)}  ${e.name}${e.type === "folder" ? "/" : ""}`).join("\n");
 
@@ -27677,47 +27811,158 @@ function createCommands({ api, out, fetchImpl = fetch }) {
       return link;
     },
 
+    // put <local file or folder>... [remote folder]: one folder lookup for the whole run, one upload call set per file.
+    // With --folder the remote folder is named there and every argument is a local path; otherwise the last argument is the
+    // remote folder when there are two or more arguments (as it always was for `put file folder`).
     async put({ args, flags }) {
-      const local = (0,external_node_path_namespaceObject.resolve)(args[0]);
-      const info = await (0,external_node_fs_promises_namespaceObject.stat)(local);
-      if (!info.isFile()) throw new Error(`${args[0]} is not a file.`);
-      const body = { name: flags.name || (0,external_node_path_namespaceObject.basename)(local), size: info.size, folder_id: await folderId(api, args[1]), sha256: await sha256Of(local), modified_at: info.mtime.toISOString() };
-      if (flags.onConflict) body.on_conflict = flags.onConflict;
-      const started = await api.post("/uploads", body);
-      if (started.action === "skip") {
-        out(`Skipped: an identical file is already there (${started.existing?.name}).`);
-        return started;
+      let locals = args;
+      let remote = flags.folder;
+      if (remote === undefined && args.length > 1) {
+        locals = args.slice(0, -1);
+        remote = args.at(-1);
       }
-      let file;
-      if (started.action === "created") {
-        file = started.file;
-      } else {
-        const handle = await (0,external_node_fs_promises_namespaceObject.open)(local, "r");
+      const jobs = [];
+      let directoryNames = false;
+      for (const arg of locals) {
+        const path = (0,external_node_path_namespaceObject.resolve)(arg);
+        const info = await (0,external_node_fs_promises_namespaceObject.stat)(path);
+        if (info.isDirectory()) {
+          directoryNames = true;
+          for (const f of await walk(path)) jobs.push({ local: f.local, remoteDir: [(0,external_node_path_namespaceObject.basename)(path), ...f.relative.split("/").slice(0, -1)], name: f.relative.split("/").at(-1), size: (await (0,external_node_fs_promises_namespaceObject.stat)(f.local)).size });
+        } else if (info.isFile()) jobs.push({ local: path, remoteDir: [], name: (0,external_node_path_namespaceObject.basename)(path), size: info.size });
+        else throw new Error(`${arg} is not a file or a folder.`);
+      }
+      if (flags.name && (jobs.length !== 1 || directoryNames)) throw new Error("--name renames one file; it cannot be used with several files or a folder.");
+      if (!jobs.length) throw new Error("Nothing to upload: the folder has no files.");
+
+      // One lookup of the destination for the whole run.
+      const destination = remote === undefined || remote === "/" ? { id: null, path: "/" } : await resolveEntry(api, remote);
+      if (destination.type && destination.type !== "folder") throw new Error(`${remote} is a file, not a folder.`);
+      const destPath = destination.id === null ? "/" : destination.path || (remote?.startsWith("/") ? remote : null);
+      const folders = new Map([["/", destination.id]]);
+      const ensureFolder = async (segments) => {
+        if (!segments.length) return destination.id;
+        if (destPath === null) throw new Error("Uploading a folder needs the destination as a path (for example /photos), or an id the API can give the path of.");
+        const path = (destPath === "/" ? "" : destPath.replace(/\/+$/, "")) + "/" + segments.join("/");
+        if (folders.has(path)) return folders.get(path);
+        let entry;
         try {
-          const contentType = started.content_type;
-          if (started.mode === "single") {
-            await putBytes(fetchImpl, started.uploads[0].url, await handle.readFile(), contentType);
-          } else {
-            const partSize = started.part_size;
-            let urls = new Map(started.uploads.map((u) => [u.partNumber, u.url]));
-            for (let part = 1; part <= started.part_count; part++) {
-              if (!urls.has(part)) {
-                const more = await api.post(`/uploads/${started.id}/parts`, { from_part: part, count: 20, ...(started.multipart_id ? { multipart_id: started.multipart_id } : {}) });
-                urls = new Map(more.uploads.map((u) => [u.partNumber, u.url]));
-              }
-              const buffer = Buffer.alloc(Math.min(partSize, info.size - (part - 1) * partSize));
-              await handle.read(buffer, 0, buffer.length, (part - 1) * partSize);
-              await putBytes(fetchImpl, urls.get(part), buffer);
-              if (!flags.json) out(`  part ${part}/${started.part_count}`);
-            }
-          }
-        } finally {
-          await handle.close();
+          entry = await api.get("/files/by-path", { path });
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 404) throw error;
+          entry = await api.post("/folders", { name: segments.at(-1), parent_id: await ensureFolder(segments.slice(0, -1)) });
         }
-        file = await api.post(`/uploads/${started.id}/complete`, { sha256: body.sha256, modified_at: body.modified_at, ...(started.multipart_id ? { multipart_id: started.multipart_id } : {}) });
+        if (entry.type && entry.type !== "folder") throw new Error(`${path} is a file, so a folder of that name cannot be made.`);
+        folders.set(path, entry.id);
+        return entry.id;
+      };
+
+      // Free space, asked once: a file bigger than what is left fails before it is hashed or sent. Best effort, the API decides.
+      // Skipped for small uploads: it is one more counted call, and only a large run can run out of space.
+      let free = null;
+      if (jobs.reduce((sum, j) => sum + j.size, 0) >= 100_000_000) try {
+        const usage = await api.get("/usage");
+        if (usage?.storage?.free_bytes !== null && usage?.storage?.free_bytes !== undefined) free = Number(usage.storage.free_bytes);
+      } catch {
+        free = null;
       }
-      show(file, `Uploaded ${file?.name ?? body.name} (${formatBytes(info.size)})${started.will_be_renamed ? " under a numbered name, the name was taken" : ""}`, flags.json);
-      return file;
+
+      const putOne = async (job, info, folderId) => {
+        if (info.size > 100_000_000 && !flags.json) out(`Hashing ${job.name} (${formatBytes(info.size)})...`);
+        const body = { name: flags.name || job.name, size: info.size, folder_id: folderId, sha256: await sha256Of(job.local), modified_at: info.mtime.toISOString() };
+        if (flags.onConflict) body.on_conflict = flags.onConflict;
+        const started = await api.post("/uploads", body);
+        if (started.action === "skip") {
+          out(`Skipped: an identical file is already there (${started.existing?.name}).`);
+          return { value: started, uploaded: false };
+        }
+        let file;
+        if (started.action === "created") {
+          file = started.file;
+        } else {
+          try {
+            await sendBytes(job.local, info.size, started);
+          } catch (error) {
+            // Give the reserved space back and leave no half-finished session behind. Best effort.
+            await api.del(`/uploads/${started.id}`, started.multipart_id ? { multipart_id: started.multipart_id } : undefined).catch(() => {});
+            throw error;
+          }
+          file = await api.post(`/uploads/${started.id}/complete`, { sha256: body.sha256, modified_at: body.modified_at, ...(started.multipart_id ? { multipart_id: started.multipart_id } : {}) });
+        }
+        show(file, `Uploaded ${file?.name ?? body.name} (${formatBytes(info.size)})${started.will_be_renamed ? " under a numbered name, the name was taken" : ""}`, flags.json);
+        return { value: file, uploaded: true };
+      };
+
+      // Streams the file to the signed addresses: no whole file in memory, three parts at a time, a fresh address after a failed try.
+      const sendBytes = async (local, size, started) => {
+        const stream = (start, end) => () => external_node_stream_.Readable.toWeb((0,external_node_fs_namespaceObject.createReadStream)(local, { start, end }));
+        if (started.mode === "single") {
+          await api.storagePut(started.uploads[0].url, { makeBody: stream(0, size - 1), size, contentType: started.content_type });
+          return;
+        }
+        const partSize = started.part_size;
+        const urls = new Map(started.uploads.map((u) => [u.partNumber, u.url]));
+        const batches = new Map();
+        const fetchBatch = (from) => {
+          if (!batches.has(from)) {
+            batches.set(from, api.post(`/uploads/${started.id}/parts`, { from_part: from, count: URL_BATCH, ...(started.multipart_id ? { multipart_id: started.multipart_id } : {}) }).then((more) => {
+              for (const u of more.uploads) urls.set(u.partNumber, u.url);
+            }));
+          }
+          return batches.get(from);
+        };
+        const urlFor = async (part, fresh = false) => {
+          if (fresh || !urls.has(part)) {
+            if (fresh) batches.delete(part);
+            urls.delete(part);
+            await fetchBatch(part);
+          }
+          return urls.get(part);
+        };
+        let next = 1;
+        let aborted = false;
+        const worker = async () => {
+          while (!aborted && next <= started.part_count) {
+            const part = next++;
+            const start = (part - 1) * partSize;
+            const end = Math.min(start + partSize, size) - 1;
+            try {
+              await api.storagePut(await urlFor(part), { makeBody: stream(start, end), size: end - start + 1, refreshUrl: () => urlFor(part, true) });
+            } catch (error) {
+              aborted = true;
+              throw error;
+            }
+            if (!flags.json) out(`  part ${part}/${started.part_count}`);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, started.part_count) }, worker));
+      };
+
+      const results = [];
+      let firstError = null;
+      let failed = 0;
+      for (const job of jobs) {
+        try {
+          const info = await (0,external_node_fs_promises_namespaceObject.stat)(job.local);
+          if (free !== null && info.size > free) {
+            throw new ApiError({ code: "storage_full", detail: `${job.name} is ${formatBytes(info.size)} and only ${formatBytes(free)} of storage is free. Free some space or change the plan.` }, 413);
+          }
+          const result = await putOne(job, info, await ensureFolder(job.remoteDir));
+          if (result.uploaded && free !== null) free = Math.max(0, free - info.size);
+          results.push(result.value);
+        } catch (error) {
+          failed++;
+          firstError ??= error;
+          err(`tarkle: ${job.local}: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
+          // A used-up quota or a refused key will fail the same way for every other file: stop here.
+          if (error instanceof ApiError && (error.code === "quota_exceeded" || error.status === 401 || error.status === 403 || error.code === "no_token")) break;
+        }
+      }
+      if (firstError) {
+        if (jobs.length > 1) err(`tarkle: ${failed} of ${jobs.length} file(s) were not uploaded.`);
+        throw firstError;
+      }
+      return jobs.length === 1 ? results[0] : results;
     },
 
     async brands({ flags }) {
@@ -27774,10 +28019,73 @@ function createCommands({ api, out, fetchImpl = fetch }) {
       return transfer;
     },
 
+    // Search needs no credits; ask spends them (the answer says how many). Every word after the command is the query or the question.
+    async search({ args, flags }) {
+      const q = args.join(" ").trim();
+      if (!q) throw new Error("Give the words to look for: tarkle search <words>.");
+      const query = { q, limit: flags.limit };
+      if (flags.folder) query.folder = await folderId(api, flags.folder);
+      const data = await api.get("/files/search", query);
+      const c = data.coverage;
+      const lines = data.results.map((r) => `${r.file_id}${r.page ? ` p.${r.page}` : ""}  ${r.name}\n    ${r.snippet}`);
+      const note = `Searched ${c.searched} of ${c.files} files${c.notSearchable ? `; ${c.notSearchable} cannot be searched as text` : ""}${c.waiting ? `; ${c.waiting} still waiting to be read (search again)` : ""}.`;
+      show(data, `${lines.length ? lines.join("\n") : "No passages found."}\n${note}`, flags.json);
+      return data;
+    },
+
+    async ask({ args, flags }) {
+      const question = args.join(" ").trim();
+      if (!question) throw new Error("Give the question: tarkle ask <question>.");
+      const body = { question, ...(flags.deep ? { mode: "deep" } : {}) };
+      if (flags.folder) body.folder = await folderId(api, flags.folder);
+      if (flags.history) {
+        try {
+          body.history = JSON.parse(await (0,external_node_fs_promises_namespaceObject.readFile)(flags.history, "utf8"));
+        } catch {
+          throw new Error(`--history must be a JSON file with a list of { role, content } messages (could not read ${flags.history}).`);
+        }
+      }
+      const data = await api.post("/ai/ask", body);
+      const sources = data.sources.map((s) => `[${s.n}] ${s.name}${s.file_id ? ` (file ${s.file_id}${s.pages?.length ? `, p.${s.pages.join(",")}` : ""})` : ""}`);
+      const cost = data.credits_used > 0 ? `${data.credits_used} credit${data.credits_used === 1 ? "" : "s"} used${data.paid_by ? ` (${data.paid_by})` : ""}.` : "No credits used.";
+      const notes = Array.isArray(data.notes) && data.notes.length ? `${data.notes.join("\n")}\n` : "";
+      show(data, `${data.answer}${sources.length ? `\n\nSources:\n${sources.join("\n")}` : ""}\n\n${notes}${cost}`, flags.json);
+      return data;
+    },
+
     async unshare({ args, flags }) {
       const data = await api.del(`/transfers/${args[0]}`);
       show(data, "Deleted. The link stopped working.", flags.json);
       return data;
+    },
+
+    async gallery({ args, flags }) {
+      if (!flags.title) throw new Error("A gallery needs a title: --title \"...\".");
+      // Major units, as the API takes them: 25 or 25.50 is twenty-five dollars, not cents.
+      if (flags.price !== undefined && !(/^\d{1,5}(\.\d{1,2})?$/.test(flags.price) && Number(flags.price) > 0)) {
+        throw new Error(`--price must be a positive amount in whole currency units with at most two decimals, such as 25 or 25.50 (got "${flags.price}").`);
+      }
+      let previewCount;
+      if (flags.previewCount !== undefined) {
+        previewCount = Number(flags.previewCount);
+        if (!Number.isInteger(previewCount)) throw new Error(`--preview-count must be a whole number (got "${flags.previewCount}").`);
+      }
+      const folder = await resolveEntry(api, args[0]);
+      if (folder.type !== "folder") throw new Error(`${args[0]} is a file. A gallery is made from a folder of photos.`);
+      if (folder.id === null) throw new Error("Cannot make a gallery from the whole library root. Pick a folder.");
+      const body = {
+        folder_id: folder.id,
+        title: flags.title,
+        ...(flags.price !== undefined ? { price: flags.price } : {}),
+        ...(flags.currency ? { currency: flags.currency } : {}),
+        ...(flags.watermark ? { watermark: true } : {}),
+        ...(flags.clientName ? { client_name: flags.clientName } : {}),
+        ...(flags.previewMode ? { preview_mode: flags.previewMode } : {}),
+        ...(previewCount !== undefined ? { preview_count: previewCount } : {}),
+      };
+      const gallery = await api.post("/galleries", body);
+      show(gallery, [gallery.gallery_url, ...(gallery.pay_url ? [`Pay link: ${gallery.pay_url}`] : [])].join("\n"), flags.json);
+      return gallery;
     },
   };
 }
@@ -27785,7 +28093,7 @@ function createCommands({ api, out, fetchImpl = fetch }) {
 const helpText = (/* unused pure expression or super */ null && (`tarkle: command line for the Tarkle API
 
 Setup
-  tarkle login <token> [--workspace <key>]   save a token (Settings > API); picks the workspace when there is one
+  tarkle login [--workspace <key>] [--token-stdin]   save a key (Settings > API) read from TARKLE_API_KEY, stdin or a prompt; picks the workspace when there is one
   tarkle workspaces                          list the workspaces the token can use
   tarkle whoami                              show the saved workspace and API address
 
@@ -27794,7 +28102,7 @@ Files (a remote name is an id or an absolute path such as /photos/2026)
   tarkle ls [path|id] [--recursive] [--type file|folder]   list a folder (recursive lists files unless --type folder)
   tarkle stat <path|id>                      show one file or folder
   tarkle mkdir <path>                        create a folder
-  tarkle put <local file> [folder] [--name n] [--on-conflict version|separate|skip]
+  tarkle put <local file or folder>... [remote folder] [--folder remote] [--name n] [--on-conflict version|separate|skip]   several files or whole folders, one folder lookup
   tarkle get <path|id> [local file] [--url]  download, or print a short-lived link
   tarkle mv <path|id> <folder> [--name n]    move
   tarkle rename <path|id> <name>             rename
@@ -27802,10 +28110,18 @@ Files (a remote name is an id or an absolute path such as /photos/2026)
   tarkle rm <path|id> [--confirm-delete-transfers]   move to the bin
   tarkle restore <id>                        restore from the bin
 
+Search and ask (the words after the command are the query or the question; --folder limits it to one folder)
+  tarkle search <words> [--folder path|id] [--limit 1-20]   the passages inside the files that match; uses no credits
+  tarkle ask <question> [--folder path|id] [--deep] [--history file.json]         an answer from the files with its sources; spends AI credits like a question in the app (needs a token with ai:ask)
+
 Sharing (a shareable link from one or more files or folders already in the library)
   tarkle share <path|id> [path|id...] [--password p] [--expires-at iso] [--burn-after-read]
                [--view-only] [--download-mode standard|email_required|direct] [--title t] [--description d]
   tarkle unshare <transfer id>               end a transfer early; the link stops working at once
+
+Galleries (a folder of photos shown as a gallery; with --price it is paid: watermarked until bought, needs Pro and PayPal or Stripe)
+  tarkle gallery <folder path|id> --title t [--price 25] [--currency USD] [--watermark] [--client-name n]
+               [--preview-mode all|first] [--preview-count 0-6]   price is in whole units (25.50), not cents
 
 Brands
   tarkle brands                              list brand pages
@@ -27817,9 +28133,10 @@ Brands
 Options
   --json                 print the API answer as JSON
   --workspace <key>      workspace key for this call (or TARKLE_WORKSPACE)
-  --api-url <url>        API address (or TARKLE_API_URL), default https://tarkle.com/api/v1
+  --api-url <url>        API address (or TARKLE_API_URL), default ${DEFAULT_API_URL}
 
-Token: TARKLE_API_TOKEN, or saved by tarkle login in ~/.config/tarkle/config.json.`));
+Key: TARKLE_API_KEY (or TARKLE_API_TOKEN), or saved by tarkle login in ~/.config/tarkle/config.json.
+Exit codes: 0 done, 1 error, 2 not signed in or not allowed, 3 daily quota used up, 4 rate limited after retries, 5 network or server trouble. With --json an error is one JSON object on stderr.`));
 
 ;// CONCATENATED MODULE: ./src/run.js
 // Share files with Tarkle -- uploads each file via the real Tarkle CLI's own commands (no upload or
@@ -27922,9 +28239,32 @@ async function run() {
   return transfer;
 }
 
+const EXIT_MEANING = {
+  1: "error",
+  2: "not signed in or not allowed",
+  3: "daily quota or AI credits used up, do not retry",
+  4: "rate limited after retries, run again later",
+  5: "network or server trouble",
+};
+
+/** Turns a thrown error into the same exit code the CLI would return, so a workflow can react to the cause. */
+function failureOf(error) {
+  const exitCode = exitCodeFor(error);
+  const detail = errorJson(error).error;
+  return { exitCode, code: detail.code, status: detail.status, retryAfter: detail.retry_after ?? "", message: formatError(error) };
+}
+
+function reportFailure(error) {
+  const failure = failureOf(error);
+  core.setOutput("exit-code", String(failure.exitCode));
+  core.setOutput("error-code", failure.code);
+  core.setOutput("retry-after", String(failure.retryAfter));
+  core.setFailed(`${failure.message}\n(exit code ${failure.exitCode}: ${EXIT_MEANING[failure.exitCode] ?? "error"})`);
+  return failure;
+}
+
 ;// CONCATENATED MODULE: ./src/index.js
 
 
-
-run().catch((error) => core.setFailed(error instanceof Error ? error.message : String(error)));
+run().catch(reportFailure);
 

@@ -1,7 +1,7 @@
 {
   "name": "tarkle-upload-action",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Share files with Tarkle -- a GitHub Action",
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
-    "@tarkle/cli": "^0.2.0"
+    "@tarkle/cli": "^0.3.0"
   },
   "devDependencies": {
     "@vercel/ncc": "^0.45.0"

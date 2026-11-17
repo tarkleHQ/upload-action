@@ -67,7 +67,7 @@ secret. `workspace` is the 8-character workspace key (also shown on that page, o
 | `title` | No | — | Shown on the share page. |
 | `description` | No | — | Shown on the share page. |
 | `on-conflict` | No | the workspace's own rule | `version`, `separate` or `skip`, when a file of the same name already exists in the destination. |
-| `api-url` | No | `https://tarkle.com/api/v1` | The Tarkle API base URL. |
+| `api-url` | No | the address built into the Tarkle CLI | The Tarkle API base URL. |
 
 ## Outputs
 
@@ -77,6 +77,33 @@ secret. `workspace` is the 8-character workspace key (also shown on that page, o
 | `id` | The transfer id. |
 | `expires-at` | When the link expires (ISO 8601), or empty if it never does. |
 | `result` | The complete JSON response from `POST /api/v1/transfers`. |
+| `exit-code` | Set when the step fails. The same codes as the Tarkle CLI (table below). |
+| `error-code` | Set when the step fails. The API error code, such as `quota_exceeded` or `unauthorized`. |
+| `retry-after` | Set when the step fails and the API said when to try again. |
+
+### Failure codes
+
+When the step fails, `exit-code` tells a workflow why, so a later step with `if: failure()` can react:
+
+| Code | Meaning |
+|---|---|
+| 1 | Error (bad input, not found, conflict) |
+| 2 | Not signed in, key refused or not allowed |
+| 3 | The daily quota or the AI credits are used up: do not retry |
+| 4 | Rate limited, still after the retries: run again later |
+| 5 | Network or server trouble |
+
+```yaml
+- id: share
+  uses: tarkleHQ/upload-action@v1
+  with:
+    api-key: ${{ secrets.TARKLE_API_KEY }}
+    workspace: abcd1234
+    files: build.zip
+  continue-on-error: true
+- if: steps.share.outputs.exit-code == '3'
+  run: echo "Tarkle quota is used up, the link was not created."
+```
 
 ## Security
 
